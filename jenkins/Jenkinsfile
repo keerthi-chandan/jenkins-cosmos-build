@@ -1,0 +1,51 @@
+pipeline {
+    agent any
+
+    tools {
+        go 'GO_1_23'
+    }
+
+    parameters {
+        choice(name: 'CHAIN', choices: ['babylon', 'celestia', 'noble'], description: 'Chain to build')
+    }
+
+    environment {
+        GOPATH = "${WORKSPACE}/go"
+        PATH = "${WORKSPACE}/go/bin:${PATH}"
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh '''
+                    set -e
+
+                    case "$CHAIN" in
+                      babylon)
+                        REPO=https://github.com/babylonlabs-io/babylon.git
+                        VERSION=v1.0.0
+                        DAEMON=babylond
+                        ;;
+                      celestia)
+                        REPO=https://github.com/celestiaorg/celestia-app.git
+                        VERSION=v3.0.0
+                        DAEMON=celestia-appd
+                        ;;
+                      noble)
+                        REPO=https://github.com/noble-assets/noble.git
+                        VERSION=v8.0.0
+                        DAEMON=nobled
+                        ;;
+                    esac
+
+                    rm -rf src
+                    git clone $REPO src
+                    cd src
+                    git checkout $VERSION
+                    make install
+                    $GOPATH/bin/$DAEMON version
+                '''
+            }
+        }
+    }
+}

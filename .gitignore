@@ -1,0 +1,24 @@
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local secrets / state that must never go public
+*.pem
+*.key
+*.env
+.aws/
+terraform.tfstate*
+*.tfvars
+
+# Jenkins workspace artifacts if you run Jenkins locally
+jenkins_home/
+workspace/
+
+# Build outputs
+*.tar.gz
+*.zip
+bin/
+build/
