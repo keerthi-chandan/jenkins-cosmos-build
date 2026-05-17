@@ -1,3 +1,6 @@
+// Multi-stage build/verify pipeline for Cosmos SDK chain binaries.
+// Each stage is annotated with the Jenkins concept it demonstrates.
+
 pipeline {
     agent any
 
@@ -11,41 +14,137 @@ pipeline {
 
     environment {
         GOPATH = "${WORKSPACE}/go"
-        PATH = "${WORKSPACE}/go/bin:${PATH}"
+        PATH   = "${WORKSPACE}/go/bin:${PATH}"
     }
 
     stages {
+
+        // Stage 1 — concept: script{} block + env mutation that persists across later stages.
+        // A plain `sh` runs in its own shell, so vars set inside don't survive to the next stage.
+        // Using a Groovy map + env.FOO = ... is the idiomatic way to share values.
+        stage('Checkout & Pin') {
+            steps {
+                script {
+                    def chains = [
+                        babylon:  [repo: 'https://github.com/babylonlabs-io/babylon.git',     version: 'v1.0.0', daemon: 'babylond'],
+                        celestia: [repo: 'https://github.com/celestiaorg/celestia-app.git',   version: 'v3.0.0', daemon: 'celestia-appd'],
+                        noble:    [repo: 'https://github.com/noble-assets/noble.git',         version: 'v8.0.0', daemon: 'nobled'],
+                    ]
+                    def c = chains[params.CHAIN]
+                    env.REPO    = c.repo
+                    env.VERSION = c.version
+                    env.DAEMON  = c.daemon
+                }
+                sh '''
+                    set -e
+                    rm -rf src
+                    git clone "$REPO" src
+                    git -C src checkout "$VERSION"
+                '''
+            }
+        }
+
+        // Stage 2 — concept: tools{} block surfaces Go on PATH; standard sh step.
         stage('Build') {
             steps {
                 sh '''
                     set -e
-
-                    case "$CHAIN" in
-                      babylon)
-                        REPO=https://github.com/babylonlabs-io/babylon.git
-                        VERSION=v1.0.0
-                        DAEMON=babylond
-                        ;;
-                      celestia)
-                        REPO=https://github.com/celestiaorg/celestia-app.git
-                        VERSION=v3.0.0
-                        DAEMON=celestia-appd
-                        ;;
-                      noble)
-                        REPO=https://github.com/noble-assets/noble.git
-                        VERSION=v8.0.0
-                        DAEMON=nobled
-                        ;;
-                    esac
-
-                    rm -rf src
-                    git clone $REPO src
                     cd src
-                    git checkout $VERSION
                     make install
-                    $GOPATH/bin/$DAEMON version
+                    "$GOPATH/bin/$DAEMON" version
                 '''
             }
+        }
+
+        // Stage 3 — concept: parallel{} runs two stages concurrently on the same agent.
+        // Useful when steps are independent — saves wall-clock time.
+        stage('Verify & Lint') {
+            parallel {
+                stage('Verify Binary') {
+                    steps {
+                        sh '''
+                            set -e
+                            BIN="$GOPATH/bin/$DAEMON"
+                            "$BIN" version --long
+                            sha256sum "$BIN" | tee "$WORKSPACE/${DAEMON}.sha256"
+                        '''
+                    }
+                }
+                stage('Lint') {
+                    steps {
+                        // `go vet` is built into the Go toolchain — no extra install, fast,
+                        // friendly to t3.micro's 1 GB RAM. Swap to golangci-lint on a bigger agent.
+                        // `|| true` keeps the build green on findings — this is a learning pipeline.
+                        sh '''
+                            set -e
+                            cd src
+                            go vet ./... || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        // Stage 4 — concept: timeout{} caps wall-clock; retry{} re-runs on transient failure.
+        // Smoke = "binary initializes a home dir correctly" — cheap, deterministic, no network.
+        stage('Smoke Test') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    retry(2) {
+                        sh '''
+                            set -e
+                            HOME_DIR="/tmp/smoke-${DAEMON}-${BUILD_NUMBER}"
+                            rm -rf "$HOME_DIR"
+                            "$GOPATH/bin/$DAEMON" init smoke-test --home "$HOME_DIR" --chain-id smoke-1
+                            test -f "$HOME_DIR/config/genesis.json"
+                            test -f "$HOME_DIR/config/config.toml"
+                            test -f "$HOME_DIR/config/app.toml"
+                            rm -rf "$HOME_DIR"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // Stage 5 — concept: archiveArtifacts is Jenkins' built-in artifact store.
+        // Files are attached to the build, downloadable from the UI — replaces Nexus for portfolio use.
+        // fingerprint:true records a sha for cross-build tracking.
+        stage('Archive') {
+            steps {
+                sh '''
+                    set -e
+                    mkdir -p out
+                    cp "$GOPATH/bin/$DAEMON" out/
+                    cp "${DAEMON}.sha256" out/
+                    tar -czf "out/${DAEMON}-${VERSION}.tar.gz" -C out "$DAEMON" "${DAEMON}.sha256"
+                '''
+                archiveArtifacts artifacts: 'out/*.tar.gz, out/*.sha256', fingerprint: true
+            }
+        }
+
+        // Stage 6 — concept: input{} pauses the build for manual approval.
+        // Always wrap in timeout — an un-bounded input can hang forever and pin an executor.
+        stage('Approval Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    input message: "Promote ${env.DAEMON} ${env.VERSION} to staging?", ok: 'Promote'
+                }
+                echo "Approved. Real pipeline would hand off to cosmos-ansible-bootstrap here."
+            }
+        }
+    }
+
+    // Stage 7 + 8 — concept: post{} runs after all stages, branching on result.
+    // success/failure/always replace ad-hoc notify logic and run even if a stage threw.
+    post {
+        success {
+            echo "✓ Build #${env.BUILD_NUMBER} succeeded: ${env.DAEMON} ${env.VERSION}"
+        }
+        failure {
+            echo "✗ Build #${env.BUILD_NUMBER} failed. See console output for the stage that broke."
+        }
+        always {
+            sh 'rm -rf src out /tmp/smoke-* || true'
         }
     }
 }
