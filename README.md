@@ -2,7 +2,11 @@
 
 Jenkins on EC2 builds Cosmos SDK chain binaries from source, packages them into Docker images, scans them, and pushes to AWS ECR.
 
-> **Doing the hands-on?** Follow [`docs/procedure.md`](docs/procedure.md) — chronological steps + gotchas + recovery + teardown. Reference: [`docs/architecture.md`](docs/architecture.md) (diagrams), [`docs/purposes.md`](docs/purposes.md) (why each step exists).
+> **Learning the pipeline?** Start with [`docs/tutorial.md`](docs/tutorial.md) — explains every line of the Jenkinsfile and Dockerfile, with workflows + flowcharts.
+>
+> **Replaying the hands-on?** Follow [`docs/procedure.md`](docs/procedure.md) — chronological steps + gotchas + recovery + teardown.
+>
+> **Quick reference?** [`docs/architecture.md`](docs/architecture.md) (diagrams) and [`docs/purposes.md`](docs/purposes.md) (why each step exists).
 
 ## Chains
 
