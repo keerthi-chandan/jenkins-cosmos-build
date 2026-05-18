@@ -22,3 +22,7 @@ workspace/
 *.zip
 bin/
 build/
+
+# Personal learning docs — keep local, not on GitHub
+docs/tutorial.md
+docs/purposes.md
