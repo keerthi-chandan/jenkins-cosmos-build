@@ -1,150 +1,148 @@
-// Multi-stage build/verify pipeline for Cosmos SDK chain binaries.
-// Each stage is annotated with the Jenkins concept it demonstrates.
-
 pipeline {
     agent any
 
-    tools {
-        go 'GO_1_23'
-    }
-
-    parameters {
-        choice(name: 'CHAIN', choices: ['babylon', 'celestia', 'noble'], description: 'Chain to build')
-    }
-
     environment {
-        GOPATH = "${WORKSPACE}/go"
-        PATH   = "${WORKSPACE}/go/bin:${PATH}"
+        NOBLE_REPO     = 'https://github.com/strangelove-ventures/noble.git'
+        NOBLE_VERSION  = 'v11.1.0-rc.1'
+
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        ECR_REPO       = 'cosmos/nobled'
+        IMAGE_LOCAL    = "nobled:${env.BUILD_NUMBER}"
+        IMAGE_REMOTE   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${env.BUILD_NUMBER}"
+
+        PATH           = "/usr/local/go/bin:/var/lib/jenkins/go/bin:${env.PATH}"
+        GOPATH         = '/var/lib/jenkins/go'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
     }
 
     stages {
-
-        // Stage 1 — concept: script{} block + env mutation that persists across later stages.
-        // A plain `sh` runs in its own shell, so vars set inside don't survive to the next stage.
-        // Using a Groovy map + env.FOO = ... is the idiomatic way to share values.
-        stage('Checkout & Pin') {
+        stage('Checkout') {
             steps {
-                script {
-                    def chains = [
-                        babylon:  [repo: 'https://github.com/babylonlabs-io/babylon.git',     version: 'v1.0.0', daemon: 'babylond'],
-                        celestia: [repo: 'https://github.com/celestiaorg/celestia-app.git',   version: 'v3.0.0', daemon: 'celestia-appd'],
-                        noble:    [repo: 'https://github.com/noble-assets/noble.git',         version: 'v8.0.0', daemon: 'nobled'],
-                    ]
-                    def c = chains[params.CHAIN]
-                    env.REPO    = c.repo
-                    env.VERSION = c.version
-                    env.DAEMON  = c.daemon
-                }
                 sh '''
-                    set -e
-                    rm -rf src
-                    git clone "$REPO" src
-                    git -C src checkout "$VERSION"
+                    rm -rf noble
+                    git clone --depth 1 --branch ${NOBLE_VERSION} ${NOBLE_REPO} noble
                 '''
             }
         }
 
-        // Stage 2 — concept: tools{} block surfaces Go on PATH; standard sh step.
         stage('Build') {
             steps {
+                dir('noble') {
+                    sh 'make install'
+                    sh '${GOPATH}/bin/nobled version'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                dir('noble') {
+                    sh 'go test ./... -timeout 15m'
+                }
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                dir('noble') {
+                    // Report-only on upstream code we don't own; --issues-exit-code 0 keeps the build green.
+                    sh 'golangci-lint run --timeout 10m --issues-exit-code 0 ./...'
+                }
+            }
+        }
+
+        stage('Security (gosec)') {
+            steps {
+                dir('noble') {
+                    // Same rationale as Lint — report-only against upstream Cosmos code.
+                    sh 'gosec -severity medium -confidence medium -no-fail ./...'
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
                 sh '''
-                    set -e
-                    cd src
-                    make install
-                    "$GOPATH/bin/$DAEMON" version
+                    docker build \
+                        -f jenkins/Dockerfile \
+                        --build-arg NOBLE_REPO=${NOBLE_REPO} \
+                        --build-arg NOBLE_VERSION=${NOBLE_VERSION} \
+                        -t ${IMAGE_LOCAL} \
+                        .
                 '''
             }
         }
 
-        // Stage 3 — concept: parallel{} runs two stages concurrently on the same agent.
-        // Useful when steps are independent — saves wall-clock time.
-        stage('Verify & Lint') {
-            parallel {
-                stage('Verify Binary') {
-                    steps {
-                        sh '''
-                            set -e
-                            BIN="$GOPATH/bin/$DAEMON"
-                            "$BIN" version --long
-                            sha256sum "$BIN" | tee "$WORKSPACE/${DAEMON}.sha256"
-                        '''
-                    }
-                }
-                stage('Lint') {
-                    steps {
-                        // `go vet` is built into the Go toolchain — no extra install, fast,
-                        // friendly to t3.micro's 1 GB RAM. Swap to golangci-lint on a bigger agent.
-                        // `|| true` keeps the build green on findings — this is a learning pipeline.
-                        sh '''
-                            set -e
-                            cd src
-                            go vet ./... || true
-                        '''
-                    }
-                }
-            }
-        }
-
-        // Stage 4 — concept: timeout{} caps wall-clock; retry{} re-runs on transient failure.
-        // Smoke = "binary initializes a home dir correctly" — cheap, deterministic, no network.
-        stage('Smoke Test') {
-            steps {
-                timeout(time: 2, unit: 'MINUTES') {
-                    retry(2) {
-                        sh '''
-                            set -e
-                            HOME_DIR="/tmp/smoke-${DAEMON}-${BUILD_NUMBER}"
-                            rm -rf "$HOME_DIR"
-                            "$GOPATH/bin/$DAEMON" init smoke-test --home "$HOME_DIR" --chain-id smoke-1
-                            test -f "$HOME_DIR/config/genesis.json"
-                            test -f "$HOME_DIR/config/config.toml"
-                            test -f "$HOME_DIR/config/app.toml"
-                            rm -rf "$HOME_DIR"
-                        '''
-                    }
-                }
-            }
-        }
-
-        // Stage 5 — concept: archiveArtifacts is Jenkins' built-in artifact store.
-        // Files are attached to the build, downloadable from the UI — replaces Nexus for portfolio use.
-        // fingerprint:true records a sha for cross-build tracking.
-        stage('Archive') {
+        stage('Trivy Scan') {
             steps {
                 sh '''
-                    set -e
-                    mkdir -p out
-                    cp "$GOPATH/bin/$DAEMON" out/
-                    cp "${DAEMON}.sha256" out/
-                    tar -czf "out/${DAEMON}-${VERSION}.tar.gz" -C out "$DAEMON" "${DAEMON}.sha256"
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        --no-progress \
+                        ${IMAGE_LOCAL}
                 '''
-                archiveArtifacts artifacts: 'out/*.tar.gz, out/*.sha256', fingerprint: true
             }
         }
 
-        // Stage 6 — concept: input{} pauses the build for manual approval.
-        // Always wrap in timeout — an un-bounded input can hang forever and pin an executor.
-        stage('Approval Gate') {
+        stage('ECR Push') {
             steps {
-                timeout(time: 10, unit: 'MINUTES') {
-                    input message: "Promote ${env.DAEMON} ${env.VERSION} to staging?", ok: 'Promote'
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_REGION} \
+                            | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                        docker tag ${IMAGE_LOCAL} ${IMAGE_REMOTE}
+                        docker push ${IMAGE_REMOTE}
+                    '''
                 }
-                echo "Approved. Real pipeline would hand off to cosmos-ansible-bootstrap here."
             }
         }
     }
 
-    // Stage 7 + 8 — concept: post{} runs after all stages, branching on result.
-    // success/failure/always replace ad-hoc notify logic and run even if a stage threw.
     post {
         success {
-            echo "✓ Build #${env.BUILD_NUMBER} succeeded: ${env.DAEMON} ${env.VERSION}"
+            script {
+                try {
+                    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+                        sh '''
+                            curl -s -X POST -H 'Content-type: application/json' \
+                                --data "{\\"text\\":\\":white_check_mark: nobled #${BUILD_NUMBER} pushed: ${IMAGE_REMOTE}\\"}" \
+                                ${SLACK_URL} || true
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Slack notify skipped (slack-webhook credential not configured)"
+                }
+            }
         }
         failure {
-            echo "✗ Build #${env.BUILD_NUMBER} failed. See console output for the stage that broke."
+            script {
+                try {
+                    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+                        sh '''
+                            curl -s -X POST -H 'Content-type: application/json' \
+                                --data "{\\"text\\":\\":x: nobled #${BUILD_NUMBER} failed at stage ${STAGE_NAME}. ${BUILD_URL}\\"}" \
+                                ${SLACK_URL} || true
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Slack notify skipped (slack-webhook credential not configured)"
+                }
+            }
         }
         always {
-            sh 'rm -rf src out /tmp/smoke-* || true'
+            sh 'docker image prune -f --filter "label!=keep" || true'
         }
     }
 }
