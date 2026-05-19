@@ -1,5 +1,9 @@
 pipeline {
-    agent any
+    // No pipeline-level agent: each build stage explicitly runs on the
+    // 'cosmos-builder' SSH agent; post-actions explicitly pick controller vs
+    // agent. Workspace continuity across stages is fine because there is only
+    // one node with the 'cosmos-builder' label.
+    agent none
 
     environment {
         NOBLE_REPO     = 'https://github.com/strangelove-ventures/noble.git'
@@ -11,6 +15,8 @@ pipeline {
         IMAGE_LOCAL    = "nobled:${env.BUILD_NUMBER}"
         IMAGE_REMOTE   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${env.BUILD_NUMBER}"
 
+        // Paths match the agent's `jenkins` user home (/var/lib/jenkins),
+        // which jenkins-agent-setup.sh provisions identically to the controller.
         PATH           = "/usr/local/go/bin:/var/lib/jenkins/go/bin:${env.PATH}"
         GOPATH         = '/var/lib/jenkins/go'
     }
@@ -23,6 +29,7 @@ pipeline {
 
     stages {
         stage('Checkout') {
+            agent { label 'cosmos-builder' }
             steps {
                 sh '''
                     rm -rf noble
@@ -32,6 +39,7 @@ pipeline {
         }
 
         stage('Build') {
+            agent { label 'cosmos-builder' }
             steps {
                 dir('noble') {
                     sh 'make install'
@@ -41,6 +49,7 @@ pipeline {
         }
 
         stage('Test') {
+            agent { label 'cosmos-builder' }
             steps {
                 dir('noble') {
                     sh 'go test ./... -timeout 15m'
@@ -49,6 +58,7 @@ pipeline {
         }
 
         stage('Lint') {
+            agent { label 'cosmos-builder' }
             steps {
                 dir('noble') {
                     // Report-only on upstream code we don't own; --issues-exit-code 0 keeps the build green.
@@ -58,6 +68,7 @@ pipeline {
         }
 
         stage('Security (gosec)') {
+            agent { label 'cosmos-builder' }
             steps {
                 dir('noble') {
                     // Same rationale as Lint — report-only against upstream Cosmos code.
@@ -67,6 +78,7 @@ pipeline {
         }
 
         stage('Docker Build') {
+            agent { label 'cosmos-builder' }
             steps {
                 sh '''
                     docker build \
@@ -80,6 +92,7 @@ pipeline {
         }
 
         stage('Trivy Scan') {
+            agent { label 'cosmos-builder' }
             steps {
                 // Report-only: most CVEs are in upstream base image + Cosmos deps.
                 // Real-prod remediation = bump base image, bump Go toolchain, use
@@ -95,6 +108,7 @@ pipeline {
         }
 
         stage('ECR Push') {
+            agent { label 'cosmos-builder' }
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
@@ -114,38 +128,48 @@ pipeline {
     }
 
     post {
+        // Slack notifications run on the controller (built-in node) — they only
+        // need curl, and keeping them off the agent means a notification still
+        // goes out if the agent itself is the thing that failed.
         success {
-            script {
-                try {
-                    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
-                        sh '''
-                            curl -s -X POST -H 'Content-type: application/json' \
-                                --data "{\\"text\\":\\":white_check_mark: nobled #${BUILD_NUMBER} pushed: ${IMAGE_REMOTE}\\"}" \
-                                ${SLACK_URL} || true
-                        '''
+            node('built-in') {
+                script {
+                    try {
+                        withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+                            sh '''
+                                curl -s -X POST -H 'Content-type: application/json' \
+                                    --data "{\\"text\\":\\":white_check_mark: nobled #${BUILD_NUMBER} pushed: ${IMAGE_REMOTE}\\"}" \
+                                    ${SLACK_URL} || true
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "Slack notify skipped (slack-webhook credential not configured)"
                     }
-                } catch (Exception e) {
-                    echo "Slack notify skipped (slack-webhook credential not configured)"
                 }
             }
         }
         failure {
-            script {
-                try {
-                    withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
-                        sh '''
-                            curl -s -X POST -H 'Content-type: application/json' \
-                                --data "{\\"text\\":\\":x: nobled #${BUILD_NUMBER} failed at stage ${STAGE_NAME}. ${BUILD_URL}\\"}" \
-                                ${SLACK_URL} || true
-                        '''
+            node('built-in') {
+                script {
+                    try {
+                        withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
+                            sh '''
+                                curl -s -X POST -H 'Content-type: application/json' \
+                                    --data "{\\"text\\":\\":x: nobled #${BUILD_NUMBER} failed at stage ${STAGE_NAME}. ${BUILD_URL}\\"}" \
+                                    ${SLACK_URL} || true
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "Slack notify skipped (slack-webhook credential not configured)"
                     }
-                } catch (Exception e) {
-                    echo "Slack notify skipped (slack-webhook credential not configured)"
                 }
             }
         }
+        // Image cleanup must run on the agent — that's where the docker daemon lives now.
         always {
-            sh 'docker image prune -f --filter "label!=keep" || true'
+            node('cosmos-builder') {
+                sh 'docker image prune -f --filter "label!=keep" || true'
+            }
         }
     }
 }
