@@ -15,9 +15,15 @@ pipeline {
         IMAGE_LOCAL    = "nobled:${env.BUILD_NUMBER}"
         IMAGE_REMOTE   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${env.BUILD_NUMBER}"
 
-        // Paths match the agent's `jenkins` user home (/var/lib/jenkins),
-        // which jenkins-agent-setup.sh provisions identically to the controller.
-        PATH           = "/usr/local/go/bin:/var/lib/jenkins/go/bin:${env.PATH}"
+        // Absolute PATH — do NOT interpolate ${env.PATH} here. The pipeline-level
+        // environment {} block is evaluated on the controller at pipeline init,
+        // so ${env.PATH} would be the controller's systemd-restricted PATH (often
+        // missing /usr/local/bin), then exported to the agent — which causes the
+        // durable-task wrapper's `nohup` lookup to fail silently ("process
+        // apparently never started" after 5 min). Hardcoding the full system PATH
+        // here guarantees the agent's sh wrapper can find nohup / sleep / sh / etc.
+        // /var/lib/jenkins/go/bin is GOPATH/bin where `make install` deposits nobled.
+        PATH           = "/usr/local/go/bin:/var/lib/jenkins/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         GOPATH         = '/var/lib/jenkins/go'
     }
 
