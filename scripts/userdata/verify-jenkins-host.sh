@@ -1,37 +1,19 @@
 #!/bin/bash
 
-# Verifies that everything jenkins-setup.sh installs is present and working.
-# Run on the Jenkins EC2 after userdata finishes.
-
-# Load Go's PATH if the current shell hasn't yet
-if [ -f /etc/profile.d/go.sh ]; then
-    source /etc/profile.d/go.sh
-fi
+# Verifies that the Jenkins **controller** EC2 (provisioned by jenkins-setup.sh)
+# is healthy. Run on the controller after userdata finishes.
+#
+# The controller only runs the Jenkins server itself — none of the build
+# toolchain lives here. To verify the build agent, run verify-jenkins-agent.sh
+# on the cosmos-builder EC2.
 
 echo "=== cloud-init (was userdata done?) ==="
 cloud-init status
 
+echo
 echo "=== Jenkins ==="
 sudo systemctl status jenkins --no-pager | head -5
 
-echo "=== Docker ==="
-sudo systemctl status docker --no-pager | head -5
-docker --version
-
+echo
 echo "=== JDK ==="
 java -version
-
-echo "=== Go ==="
-go version
-
-echo "=== golangci-lint ==="
-golangci-lint --version
-
-echo "=== gosec ==="
-gosec -version 2>&1 | head -3
-
-echo "=== Trivy ==="
-trivy --version | head -3
-
-echo "=== AWS CLI ==="
-aws --version
