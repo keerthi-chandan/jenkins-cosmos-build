@@ -131,6 +131,55 @@ pipeline {
                 }
             }
         }
+
+        stage('ECS Deploy') {
+            agent { label 'cosmos-builder' }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        set -eu
+                        echo "==> Reading current task def for nobled-smoke"
+                        aws ecs describe-task-definition \
+                            --task-definition nobled-smoke \
+                            --region ${AWS_REGION} \
+                            --query 'taskDefinition' \
+                            --output json > current-task-def.json
+                        echo "==> Patching image tag to ${IMAGE_REMOTE}"
+                        jq --arg IMG "${IMAGE_REMOTE}" '
+                            .containerDefinitions[0].image = $IMG
+                            | del(.taskDefinitionArn, .revision, .status,
+                                  .requiresAttributes, .compatibilities,
+                                  .registeredAt, .registeredBy)
+                        ' current-task-def.json > new-task-def.json
+                        echo "==> Registering new task definition revision"
+                        NEW_ARN=$(aws ecs register-task-definition \
+                            --region ${AWS_REGION} \
+                            --cli-input-json file://new-task-def.json \
+                            --query 'taskDefinition.taskDefinitionArn' \
+                            --output text)
+                        echo "    new revision: ${NEW_ARN}"
+                        echo "==> Updating nobled-smoke-service"
+                        aws ecs update-service \
+                            --cluster nobled-cluster \
+                            --service nobled-smoke-service \
+                            --task-definition "${NEW_ARN}" \
+                            --region ${AWS_REGION} > /dev/null
+                        echo "==> Waiting for services-stable (build fails if rollout doesn't succeed)"
+                        aws ecs wait services-stable \
+                            --cluster nobled-cluster \
+                            --services nobled-smoke-service \
+                            --region ${AWS_REGION}
+                        echo "==> Rollout complete"
+                        rm -f current-task-def.json new-task-def.json
+                    '''
+                }
+            }
+        }
     }
 
     post {
